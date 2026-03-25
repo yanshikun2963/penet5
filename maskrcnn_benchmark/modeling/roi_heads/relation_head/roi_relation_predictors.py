@@ -104,10 +104,14 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        # Self-distillation: EMA teacher prototypes
+        ##### Self-Distillation via EMA Prototypes
         self.ema_momentum = 0.999
-        self.distill_temperature = 4.0  # temperature for soft targets
-        self.distill_loss_weight = 1.0  # weight for KL loss
+        self.distill_temp = 4.0  # temperature for soft targets (higher = softer)
+        self.distill_weight = 1.0  # weight for KL divergence loss
+        # EMA prototype buffer: initialized later on first forward pass
+        self.register_buffer('ema_proto', None)
+        self.register_buffer('ema_initialized', torch.tensor(0))
+        #####
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -132,10 +136,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             self.mode = 'sgdet'
         
         self.nms_thresh = self.cfg.TEST.RELATION.LATER_NMS_PREDICTION_THRES
-
-        # EMA teacher prototype buffer (initialized on first forward)
-        self.register_buffer('ema_proto', None)
-        self.ema_initialized = False
 
 
     def forward(self, proposals, rel_pair_idxs, rel_labels, rel_binarys, roi_features, union_features, logger=None):
@@ -217,6 +217,27 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         if self.training:
 
+            ### Self-Distillation via EMA Prototypes
+            if self.ema_initialized == 0:
+                self.ema_proto = predicate_proto.clone().detach()
+                self.ema_initialized.fill_(1)
+            else:
+                # Update EMA prototype
+                with torch.no_grad():
+                    self.ema_proto = self.ema_momentum * self.ema_proto + (1 - self.ema_momentum) * predicate_proto.detach()
+            # Compute teacher logits from EMA prototypes
+            with torch.no_grad():
+                ema_proto_norm = self.ema_proto / (self.ema_proto.norm(dim=1, keepdim=True) + 1e-8)
+                teacher_logits = rel_rep_norm @ ema_proto_norm.t() * self.logit_scale.exp()
+                teacher_probs = F.softmax(teacher_logits / self.distill_temp, dim=1)
+            # Student logits (already computed as rel_dists before split)
+            student_logits_cat = cat([rd for rd in rel_dists], dim=0)
+            student_log_probs = F.log_softmax(student_logits_cat / self.distill_temp, dim=1)
+            # KL divergence loss
+            kl_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean') * (self.distill_temp ** 2)
+            add_losses.update({"distill_loss": self.distill_weight * kl_loss})
+            ### end
+
             ### Prototype Regularization  ---- cosine similarity
             target_rpredicate_proto_norm = predicate_proto_norm.clone().detach() 
             simil_mat = predicate_proto_norm @ target_rpredicate_proto_norm.t()  # Semantic Matrix S = C_norm @ C_norm.T
@@ -250,24 +271,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
-
-            ### Self-distillation with EMA teacher prototypes
-            with torch.no_grad():
-                if not self.ema_initialized:
-                    self.ema_proto = predicate_proto_norm.clone().detach()
-                    self.ema_initialized = True
-                else:
-                    self.ema_proto = self.ema_momentum * self.ema_proto + (1 - self.ema_momentum) * predicate_proto_norm.detach()
-            # Teacher logits using EMA prototypes (with higher temperature for softer targets)
-            teacher_logits = rel_rep_norm @ self.ema_proto.t() * self.logit_scale.exp() / self.distill_temperature
-            # Student logits (same temperature for fair comparison)
-            student_logits = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp() / self.distill_temperature
-            # KL divergence: student learns from temporally-smoothed teacher
-            teacher_probs = F.softmax(teacher_logits.detach(), dim=1)
-            student_log_probs = F.log_softmax(student_logits, dim=1)
-            distill_loss = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
-            add_losses.update({"distill_loss": distill_loss * self.distill_loss_weight})
-            ### end self-distillation
  
         return entity_dists, rel_dists, add_losses, add_data
 
