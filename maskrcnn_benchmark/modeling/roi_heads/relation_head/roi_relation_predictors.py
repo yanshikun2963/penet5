@@ -104,19 +104,16 @@ class PrototypeEmbeddingNetwork(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
-        ##### Enhanced SAPS: Semantic-Aware Prototype Separation
-        # Stronger version with confusion-guided margins
-        rel_embed_vecs_local = rel_vectors(rel_classes, wv_dir=config.GLOVE_DIR, wv_dim=self.embed_dim)
-        with torch.no_grad():
-            glove_norms = rel_embed_vecs_local / (rel_embed_vecs_local.norm(dim=1, keepdim=True) + 1e-8)
-            glove_sim = glove_norms @ glove_norms.t()
-            glove_sim.fill_diagonal_(0.0)
-            glove_sim = torch.clamp(glove_sim, min=0.0)
-        self.register_buffer('glove_sim_matrix', glove_sim)
-        self.saps_lambda = 1.5  # Stronger than round 1 (was 0.5)
-        self.saps_margin = 15.0  # Stronger than round 1 (was 10.0)
+        ##### Component 2: Training-time Logit Adjustment
+        pred_freq = torch.FloatTensor([0.5, 68507, 8768, 3839, 2338, 944, 4278, 280, 213, 2978,
+            996, 817, 266, 244, 152, 724, 218, 1001, 413, 9171,
+            2097, 23147, 21584, 1415, 717, 194, 307, 224, 116, 6555,
+            2172, 48961, 5765, 3219, 2082, 1010, 269, 188, 258, 365,
+            195, 2413, 2236, 1009, 266, 293, 183, 149, 2000, 7917, 1049]).clamp(min=1.0)
+        pred_prior = pred_freq / pred_freq.sum()
+        self.register_buffer('log_prior', torch.log(pred_prior + 1e-12))
+        self.tau_adj = 1.0
         #####
-
 
         ##### refine object labels
         self.pos_embed = nn.Sequential(*[
@@ -214,7 +211,10 @@ class PrototypeEmbeddingNetwork(nn.Module):
         predicate_proto_norm = predicate_proto / predicate_proto.norm(dim=1, keepdim=True)  # c_norm
 
         ### (Prototype-based Learning  ---- cosine similarity) & (Relation Prediction)
-        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()  #  <r_norm, c_norm> / τ
+        rel_dists = rel_rep_norm @ predicate_proto_norm.t() * self.logit_scale.exp()
+        # Logit Adjustment: shift logits by class prior during training
+        if self.training:
+            rel_dists = rel_dists + self.tau_adj * self.log_prior.unsqueeze(0)
         # the rel_dists will be used to calculate the Le_sim with the ce_loss
 
         entity_dists = entity_dists.split(num_objs, dim=0)
@@ -240,13 +240,6 @@ class PrototypeEmbeddingNetwork(nn.Module):
             add_losses.update({"dist_loss2": dist_loss})
             ### end 
 
-            ### Enhanced SAPS loss: Push semantically similar prototypes further apart
-            weighted_margin = self.saps_margin * self.glove_sim_matrix
-            saps_violation = torch.clamp(weighted_margin - proto_dis_mat, min=0.0)
-            saps_loss = (saps_violation * self.glove_sim_matrix).sum() / (self.glove_sim_matrix.sum() + 1e-8)
-            add_losses.update({"saps_loss": self.saps_lambda * saps_loss})
-            ### end
-
             ###  Prototype-based Learning  ---- Euclidean distance
             rel_labels = cat(rel_labels, dim=0)
             gamma1 = 1.0
@@ -262,6 +255,7 @@ class PrototypeEmbeddingNetwork(nn.Module):
             loss_sum = torch.max(torch.zeros(rel_labels.size(0)).cuda(), distance_set_pos - topK_sorted_distance_set_neg + gamma1).mean()
             add_losses.update({"loss_dis": loss_sum})     # Le_euc = max(0, (g+) - (g-) + gamma1)
             ### end 
+
  
         return entity_dists, rel_dists, add_losses, add_data
 
